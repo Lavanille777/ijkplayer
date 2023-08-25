@@ -114,6 +114,29 @@ void ijkmp_change_state_l(IjkMediaPlayer *mp, int new_state)
     ffp_notify_msg1(mp->ffplayer, FFP_MSG_PLAYBACK_STATE_CHANGED);
 }
 
+CVPixelBufferRef ijkmp_get_pixelbuffer(IjkMediaPlayer *mp)
+{
+    return mp->ffplayer->szt_pixelbuffer;
+}
+
+int ijkmp_pixelbuffer_mutex_init(IjkMediaPlayer *mp)
+{
+    int ret = ffp_pixelbuffer_mutex_init(mp->ffplayer);
+    return ret;
+}
+
+int ijkmp_pixelbuffer_mutex_lock(IjkMediaPlayer *mp)
+{
+    int ret = ffp_pixelbuffer_lock(mp->ffplayer);
+    return ret;
+}
+
+int ijkmp_pixelbuffer_mutex_unlock(IjkMediaPlayer *mp)
+{
+    int ret = ffp_pixelbuffer_unlock(mp->ffplayer);
+    return ret;
+}
+
 IjkMediaPlayer *ijkmp_create(int (*msg_loop)(void*))
 {
     IjkMediaPlayer *mp = (IjkMediaPlayer *) mallocz(sizeof(IjkMediaPlayer));

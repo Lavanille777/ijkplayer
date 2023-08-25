@@ -48,7 +48,8 @@
     [options setFormatOptionIntValue:1                  forKey:@"reconnect"];
     [options setFormatOptionIntValue:30 * 1000 * 1000   forKey:@"timeout"];
     [options setFormatOptionValue:@"ijkplayer"          forKey:@"user-agent"];
-
+    [options setPlayerOptionIntValue:1      forKey:@"video-max-frame-width-default"];
+    
     options.showHudView   = NO;
 
     return options;

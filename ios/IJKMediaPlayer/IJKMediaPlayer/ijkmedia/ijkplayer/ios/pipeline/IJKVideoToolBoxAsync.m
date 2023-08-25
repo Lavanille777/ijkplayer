@@ -404,7 +404,7 @@ static void VTDecoderCallback(void *decompressionOutputRefCon,
 #endif
 
         OSType format_type = CVPixelBufferGetPixelFormatType(imageBuffer);
-        if (format_type != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) {
+        if (format_type != kCVPixelFormatType_32BGRA) {
             ALOGI("format_type error \n");
             goto failed;
         }
@@ -541,7 +541,7 @@ static VTDecompressionSessionRef vtbsession_create(Ijk_VideoToolBox_Opaque* cont
 
     ret = vtbformat_init(&context->fmt_desc, context->codecpar);
 
-    if (ffp->vtb_max_frame_width > 0 && width > ffp->vtb_max_frame_width) {
+    if (ffp->vtb_frame_width_default > 0 && ffp->vtb_max_frame_width > 0 && width > ffp->vtb_max_frame_width) {
         double w_scaler = (float)ffp->vtb_max_frame_width / width;
         width = ffp->vtb_max_frame_width;
         height = height * w_scaler;
@@ -555,7 +555,7 @@ static VTDecompressionSessionRef vtbsession_create(Ijk_VideoToolBox_Opaque* cont
                                                                  &kCFTypeDictionaryKeyCallBacks,
                                                                  &kCFTypeDictionaryValueCallBacks);
     CFDictionarySetSInt32(destinationPixelBufferAttributes,
-                          kCVPixelBufferPixelFormatTypeKey, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
+                          kCVPixelBufferPixelFormatTypeKey, kCVPixelFormatType_32BGRA);
     CFDictionarySetSInt32(destinationPixelBufferAttributes,
                           kCVPixelBufferWidthKey, width);
     CFDictionarySetSInt32(destinationPixelBufferAttributes,

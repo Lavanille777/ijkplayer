@@ -36,6 +36,7 @@
 #include <fcntl.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <CoreFoundation/CoreFoundation.h>
 
 #include "libavutil/avstring.h"
 #include "libavutil/eval.h"
@@ -74,6 +75,8 @@
 #include "ijkversion.h"
 #include "ijkplayer.h"
 #include <stdatomic.h>
+#include "libyuv.h"
+#include "ijksdl_vout_overlay_videotoolbox.h"
 #if defined(__ANDROID__)
 #include "ijksoundtouch/ijksoundtouch_wrap.h"
 #endif
@@ -139,6 +142,24 @@ int64_t get_valid_channel_layout(int64_t channel_layout, int channels)
 #endif
 
 static void free_picture(Frame *vp);
+
+int ffp_pixelbuffer_mutex_init(FFPlayer *ffp)
+{
+    int ret = pthread_mutex_init(&ffp->szt_pixelbuffer_mutex, NULL);
+    return ret;
+}
+            
+int ffp_pixelbuffer_lock(FFPlayer *ffp)
+{
+    int ret = pthread_mutex_lock(&ffp->szt_pixelbuffer_mutex);
+    return ret;
+}
+            
+int ffp_pixelbuffer_unlock(FFPlayer *ffp)
+{
+    int ret = pthread_mutex_unlock(&ffp->szt_pixelbuffer_mutex);
+    return ret;
+}
 
 static int packet_queue_put_private(PacketQueue *q, AVPacket *pkt)
 {
@@ -563,6 +584,119 @@ fail0:
     return ret;
 }
 
+static int copyAVFrameToPixelBuffer(FFPlayer *ffp, AVCodecContext* avctx, const AVFrame* frame, CVPixelBufferRef cv_img, const size_t* plane_strides, const size_t* plane_rows)
+{
+    int i, j;
+    size_t plane_count;
+    int status;
+    size_t rows;
+    unsigned long src_stride;
+    unsigned long dst_stride;
+    uint8_t *src_addr;
+    uint8_t *dst_addr;
+    size_t copy_bytes;
+    
+    status = CVPixelBufferLockBaseAddress(cv_img, 0);
+    if (status) {
+        av_log(
+               avctx,
+               AV_LOG_ERROR,
+               "Error: Could not lock base address of CVPixelBuffer: %d.\n",
+               status
+               );
+    }
+    
+    uint8* src_y = frame->data[0];
+    uint8* src_u = frame->data[1];
+    uint8* src_v = frame->data[2];
+    void* addr = CVPixelBufferGetBaseAddress(cv_img);
+    
+    int src_stride_y = frame->linesize[0];
+    int src_stride_u = frame->linesize[1];
+    int src_stride_v = frame->linesize[2];
+    size_t dst_width = CVPixelBufferGetBytesPerRow(cv_img);
+    
+    int src_width = frame->width;
+    int src_height = frame->height;
+    
+    I420ToARGB(src_y, src_stride_y,
+               src_u, src_stride_u,
+               src_v, src_stride_v,
+               addr, dst_width,
+               src_width, src_height);
+    
+    status = CVPixelBufferUnlockBaseAddress(cv_img, 0);
+    if (status) {
+        av_log(avctx, AV_LOG_ERROR, "Error: Could not unlock CVPixelBuffer base address: %d.\n", status);
+        return AVERROR_EXTERNAL;
+    }
+    
+    return 0;
+}
+
+int createCVPixelBuffer(FFPlayer *ffp, AVCodecContext* avctx, AVFrame* frame, CVPixelBufferRef* cvImage)
+{
+    size_t widths [AV_NUM_DATA_POINTERS];
+    size_t heights[AV_NUM_DATA_POINTERS];
+    size_t strides[AV_NUM_DATA_POINTERS];
+    int status;
+    
+    memset(widths,  0, sizeof(widths));
+    memset(heights, 0, sizeof(heights));
+    memset(strides, 0, sizeof(strides));
+    
+    widths[0] = avctx->width;
+    heights[0] = avctx->height;
+    strides[0] = frame ? frame->linesize[0] : avctx->width;
+    
+    widths[1] = (avctx->width + 1)/2;
+    heights[1] = (avctx->height + 1)/2;
+    strides[1] = frame? frame->linesize[1] : (avctx ->width + 1)/2;
+    
+    widths[2] = (avctx->width + 1)/2;
+    heights[2] = (avctx->height + 1)/2;
+    strides[2] = frame? frame->linesize[2] : (avctx ->width + 1)/2;
+    
+    if (!ffp->szt_pixelbuffer)
+    {
+        CFDictionaryRef pixelBufferAttributes;
+
+        CFTypeRef emptyDict = CFDictionaryCreate(NULL, NULL, NULL, 0,
+                                                 NULL, NULL);
+
+        pixelBufferAttributes = CFDictionaryCreate(NULL,
+            (const void**)&kCVPixelBufferIOSurfacePropertiesKey,
+            (const void**)&emptyDict,
+            1,
+            NULL,
+            NULL);
+        
+        status = CVPixelBufferCreate(
+                                     kCFAllocatorDefault,
+                                     frame->width,
+                                     frame->height,
+                                     kCVPixelFormatType_32BGRA,
+                                     pixelBufferAttributes,
+                                     cvImage
+                                     );
+        if (status)
+        {
+            return AVERROR_EXTERNAL;
+        }
+    }
+    
+    
+    status = copyAVFrameToPixelBuffer(ffp, avctx, frame, *cvImage, strides, heights);
+    if (status)
+    {
+        CFRelease(*cvImage);
+        *cvImage = NULL;
+        return status;
+    }
+    
+    return 0;
+}
+
 static int decoder_decode_frame(FFPlayer *ffp, Decoder *d, AVFrame *frame, AVSubtitle *sub) {
     int ret = AVERROR(EAGAIN);
 
@@ -584,6 +718,20 @@ static int decoder_decode_frame(FFPlayer *ffp, Decoder *d, AVFrame *frame, AVSub
                             } else if (!ffp->decoder_reorder_pts) {
                                 frame->pts = frame->pkt_dts;
                             }
+
+                            ffp_pixelbuffer_lock(ffp);
+                            CVPixelBufferRef cvImage = NULL;
+                            if (ffp->szt_pixelbuffer)
+                            {
+                                cvImage = ffp->szt_pixelbuffer;
+                            }
+                            int ret = createCVPixelBuffer(ffp, ffp->is->video_st->codecpar, frame, &cvImage);
+
+                             if (!ret)
+                            {
+                                  ffp->szt_pixelbuffer = cvImage;
+                            }
+                            ffp_pixelbuffer_unlock(ffp);
                         }
                         break;
                     case AVMEDIA_TYPE_AUDIO:
@@ -1660,6 +1808,18 @@ static int queue_picture(FFPlayer *ffp, AVFrame *src_frame, double pts, double d
             av_log(NULL, AV_LOG_FATAL, "Cannot initialize the conversion context\n");
             exit(1);
         }
+        
+        if (ffp -> videotoolbox) {
+            // TODO edit
+            ffp_pixelbuffer_lock(ffp);
+            ffp->szt_pixelbuffer = SDL_VoutOverlayVideoToolBox_GetCVPixelBufferRef(vp->bmp);  // picture->opaque;
+            ffp_pixelbuffer_unlock(ffp);
+
+            if (!ffp->szt_pixelbuffer) {
+                ALOGE("nil pixelBuffer in overlay\n");
+            }
+        }
+        
         /* update the bitmap content */
         SDL_VoutUnlockYUVOverlay(vp->bmp);
 
@@ -3116,9 +3276,6 @@ static int read_thread(void *arg)
 
     if (ffp->iformat_name)
         is->iformat = av_find_input_format(ffp->iformat_name);
-
-    av_dict_set_intptr(&ffp->format_opts, "video_cache_ptr", (intptr_t)&ffp->stat.video_cache, 0);
-    av_dict_set_intptr(&ffp->format_opts, "audio_cache_ptr", (intptr_t)&ffp->stat.audio_cache, 0);
     err = avformat_open_input(&ic, is->filename, is->iformat, &ffp->format_opts);
     if (err < 0) {
         print_error(is->filename, err);
@@ -3996,6 +4153,7 @@ FFPlayer *ffp_create()
     ffp->meta = ijkmeta_create();
 
     av_opt_set_defaults(ffp);
+
     return ffp;
 }
 
@@ -4136,7 +4294,7 @@ void *ffp_set_ijkio_inject_opaque(FFPlayer *ffp, void *opaque)
     ijkio_manager_destroyp(&ffp->ijkio_manager_ctx);
     ijkio_manager_create(&ffp->ijkio_manager_ctx, ffp);
     ijkio_manager_set_callback(ffp->ijkio_manager_ctx, ijkio_app_func_event);
-    ffp_set_option_intptr(ffp, FFP_OPT_CATEGORY_FORMAT, "ijkiomanager", (uintptr_t)ffp->ijkio_manager_ctx);
+    ffp_set_option_int(ffp, FFP_OPT_CATEGORY_FORMAT, "ijkiomanager", (int64_t)(intptr_t)ffp->ijkio_manager_ctx);
 
     return prev_weak_thiz;
 }
@@ -4150,7 +4308,7 @@ void *ffp_set_inject_opaque(FFPlayer *ffp, void *opaque)
 
     av_application_closep(&ffp->app_ctx);
     av_application_open(&ffp->app_ctx, ffp);
-    ffp_set_option_intptr(ffp, FFP_OPT_CATEGORY_FORMAT, "ijkapplication", (uint64_t)(intptr_t)ffp->app_ctx);
+    ffp_set_option_int(ffp, FFP_OPT_CATEGORY_FORMAT, "ijkapplication", (int64_t)(intptr_t)ffp->app_ctx);
 
     ffp->app_ctx->func_on_app_event = app_func_event;
     return prev_weak_thiz;
@@ -4172,15 +4330,6 @@ void ffp_set_option_int(FFPlayer *ffp, int opt_category, const char *name, int64
 
     AVDictionary **dict = ffp_get_opt_dict(ffp, opt_category);
     av_dict_set_int(dict, name, value, 0);
-}
-
-void ffp_set_option_intptr(FFPlayer *ffp, int opt_category, const char *name, uintptr_t value)
-{
-    if (!ffp)
-        return;
-
-    AVDictionary **dict = ffp_get_opt_dict(ffp, opt_category);
-    av_dict_set_intptr(dict, name, value, 0);
 }
 
 void ffp_set_overlay_format(FFPlayer *ffp, int chroma_fourcc)
